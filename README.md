@@ -30,5 +30,5 @@ I have a large media library (1,000+ movies and shows), problems have started st
 	Manually fixing everything doesn’t scale
     Playback is wildly incosistent
 
-My current setup slows down as more media is added. This project is meant to fix that and provide a local start for eventually sharing content with friends or family.
+My current setup slows down as more media is added. This project is meant to fix that and provide a local media preservation project start for eventually sharing content with friends or family.
 
