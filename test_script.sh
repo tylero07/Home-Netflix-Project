@@ -20,8 +20,9 @@ set -euo pipefail
 
 ACTION="${1:-}"
 BASE_DIR="${2:-./test_media}"
-BASE_SORTED="${2:-./sorted_media}"
+BASE_SORTED="${3:-./sorted_media}"
 BASE_MOVIES="${PWD}/movies"
+
 
 die() { echo "Error: $*" >&2; exit 1; }
 
@@ -37,7 +38,32 @@ touchf() {
 gen() {
   echo "Generating test media tree at: $BASE_DIR"
   mkdirp "$BASE_DIR"
+    # ---------------- Phase 0 Hygiene test cases ----------------
 
+  # macOS trash files
+  touchf "$BASE_DIR/movies/loose_movies/.DS_Store"
+  touchf "$BASE_DIR/movies/loose_movies/._The.Matrix.1999.1080p.BluRay.mkv"
+  touchf "$BASE_DIR/movies/directories/Dune.2021.2160p.HDR.DV.Atmos/._Dune.2021.2160p.HDR.DV.Atmos.mkv"
+
+  # codec/res quality variety (your rules: low codec = not h265, low res = <1080)
+  touchf "$BASE_DIR/movies/loose_movies/Comedy.Classic.1994.480p.x264.mp4"        # RED (both low)
+  touchf "$BASE_DIR/movies/loose_movies/Old.Action.1987.720p.x265.mkv"            # YELLO (low res only, but HEVC)
+  touchf "$BASE_DIR/movies/loose_movies/Modern.Movie.2019.1080p.x264.mkv"         # YELLO (codec low only)
+  touchf "$BASE_DIR/movies/loose_movies/Good.Movie.2020.1080p.x265.mkv"           # GREEN
+  touchf "$BASE_DIR/movies/loose_movies/Spectacle.2021.2160p.x265.mkv"            # BLUE
+
+  # duplicates by name+size (exact)
+  # NOTE: touch creates 0-byte files, so same name/size duplicates will group.
+  touchf "$BASE_DIR/movies/loose_movies/Dupe.Test.2010.1080p.x265.mkv"
+  touchf "$BASE_DIR/movies/loose_movies/Dupe.Test.2010.1080p.x265.mkv (1)"
+
+  # duplicates with same name but different size (simulate by writing bytes)
+  mkdirp "$BASE_DIR/movies/loose_movies/dupe_sizes"
+  printf 'AAAA' > "$BASE_DIR/movies/loose_movies/dupe_sizes/Size.Dupe.2005.1080p.x264.mkv"
+  printf 'BBBBBBBB' > "$BASE_DIR/movies/loose_movies/dupe_sizes/Size.Dupe.2005.1080p.x264.mkv (1)"
+  printf 'CCCCCCCCCCCC' > "$BASE_DIR/movies/loose_movies/dupe_sizes/Size.Dupe.2005.1080p.x264.mkv (2)"
+
+    # ---------------- Phase 1 Standard test cases ----------------
   # Top-level buckets
   mkdirp "$BASE_DIR/movies/loose_movies"
   mkdirp "$BASE_DIR/movies/directories"

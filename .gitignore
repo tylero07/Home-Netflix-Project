@@ -1,2 +1,3 @@
 test_media/
 *.csv
+.DS_Store
