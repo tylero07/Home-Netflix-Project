@@ -30,8 +30,8 @@ Project Goals
 
 Why This Project Exists
 
-I have a large media library (1,000+ movies and shows), problems have started stacking up:
-'''* Filenames from different sources don’t match
+I have a large media library (1,000+ movies and shows), problems have started stacking up:'''
+* Filenames from different sources don’t match
 * Scrapers break or pull the wrong movie
 * Duplicate versions pile up quietly
 * Storage fills faster than expected (files range from ~10 GB to 100+ GB)
