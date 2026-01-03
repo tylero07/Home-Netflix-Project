@@ -5,9 +5,17 @@ Instead of relying on streaming platforms that rotate or remove content, this sy
 
 This repo documents both what I’m building and how I’m thinking about it as the project evolves.
 
+# Updates/Revisions
+* Version 1.0.1
+    Will add Interface to navigate directories, generate list of recommended updates, and reconcile duplicate files
+    
+
 Project Goals
 * Normalize inconsistent movie filenames into a consistent format
 * Automatically pull basic metadata (title, year, posters, cast, etc.)
+* Generate List of Poor Quality Videos
+* Reconcile Duplicate Files
+* Easier UI to Ease Use
 * Keep metadata compatible with playback devices like the Zidoo Z9X Pro
 * Sort media by quality level
 * 4K vs 1080p

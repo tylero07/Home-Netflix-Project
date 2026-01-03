@@ -195,12 +195,29 @@ def print_menu(cwd: Path) -> None:
     print("\nCurrent directory:")
     print(f"  {cwd}\n")
     print("Choose an action:")
-    print("  1) List directory")
-    print("  2) Change directory")
-    print("  3) Scan and Prep")
+    print("  1) List directory/Easy Folder Change")
+    print("  2) Change directory Using Manual Path")
+    print("  3) Scan and Prep (Will prep for rename and generate csv plan)")
     print("  4) Show planned renames")
     print("  5) Apply renames")
     print("  6) Exit")
+
+def count_dir_stats(dirpath: Path) -> tuple[int, int]:
+    """
+    Returns (subdir_count, video_file_count)
+    Non-recursive on purpose — fast and safe.
+    """
+    subdirs = 0
+    videos = 0
+
+    for p in dirpath.iterdir():
+        if p.is_dir():
+            subdirs += 1
+        elif p.is_file() and p.suffix.lower() in VALID_VIDEO_EXTENSIONS:
+            videos += 1
+
+    return subdirs, videos
+
 
 
 def interactive_menu(start_dir: Path) -> None:
@@ -209,21 +226,80 @@ def interactive_menu(start_dir: Path) -> None:
     last_report_path = Path("rename_plan.csv").resolve()
 
     while True:
+        clear_screen()
         print_menu(cwd)
         choice = input("Enter number: ").strip()
         clear_screen()
 
         if choice == "1":
-            for p in sorted(cwd.iterdir()):
-                print(p.name + ("/" if p.is_dir() else ""))
+            while True:
+                dirs = sorted([p for p in cwd.iterdir() if p.is_dir()])
+
+                print("\nFolders:")
+                print("  0) .. (up one level)")
+
+                for i, d in enumerate(dirs, start=1):
+                    subdir_count, video_count = count_dir_stats(d)
+                    print(
+                        f"  {i}) {d.name}/ "
+                        f"[{subdir_count} dirs | {video_count} videos]"
+                    )
+
+                print("\nOptions:")
+                print("  r) refresh")
+                print("  b) back to main menu")
+
+                sel = input("Select folder #: ").strip()
+
+                if sel.lower() == "b":
+                    break
+                if sel == "r":
+                    continue
+                if sel == "0":
+                    parent = cwd.parent
+                    if parent != cwd:
+                        cwd = parent
+                    continue
+
+                # allow manual path entry
+                if not sel.isdigit():
+                    maybe = (cwd / sel).resolve()
+                    if maybe.exists() and maybe.is_dir():
+                        cwd = maybe
+                    else:
+                        print("!!!!!!!!!!!!!!Invalid selection/path!!!!!!!!!!!!!!")
+                    continue
+
+                idx = int(sel)
+                if 1 <= idx <= len(dirs):
+                    cwd = dirs[idx - 1]
+                else:
+                    print("Invalid folder number.")
+
 
         elif choice == "2":
-            target = input("Enter directory name or path: ").strip()
-            new_dir = (cwd / target).resolve()
-            if new_dir.exists() and new_dir.is_dir():
-                cwd = new_dir
-            else:
-                print("Invalid directory.")
+    
+            while True:
+                dirs = sorted([p for p in cwd.iterdir() if p.is_dir()])
+
+                print("\nFolders:")
+                for i, d in enumerate(dirs, start=1):
+                    subdir_count, video_count = count_dir_stats(d)
+                    print(f"  {i}) {d.name}/ [{subdir_count} dirs | {video_count} videos]")
+
+    
+                raw = input("Enter directory path (absolute or relative) or b to go back to menu: ").strip()
+                if not raw:
+                    print("No path entered.")
+                    continue
+                maybe = (cwd / raw).expanduser().resolve() if not Path(raw).is_absolute() else Path(raw).expanduser().resolve()
+                if raw == "b":
+                    break
+                if maybe.exists() and maybe.is_dir():
+                    cwd = maybe
+                else:
+                    print("Invalid directory:", maybe)
+                continue
 
         elif choice == "3":
             videos = iter_video_files(cwd, recursive=True)
@@ -237,10 +313,23 @@ def interactive_menu(start_dir: Path) -> None:
             if not last_plan:
                 print("No scan results yet. Run Scan first.")
             else:
+                list_length = 1
                 for item in last_plan[:30]:
                     print(f"{item.original.name} → {item.proposed.name}")
                 if len(last_plan) > 30:
                     print(f"... ({len(last_plan) - 30} more)")
+                    more_or_back = input("b to go back to menu or enter to view the next 30: ").strip()
+                    """if more_or_back == "b":
+                        break
+                    else:
+                        list_length+=1
+                        for item in last_plan[(list_length-1):(list_length*30)]:
+                            print(f"")"""
+                        
+                else:
+                    more_or_back = input("Enter b to go back to menu")
+                    break
+                
 
         elif choice == "5":
             if not last_plan:
