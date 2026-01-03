@@ -17,7 +17,7 @@ import os
 
 VALID_VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".m2ts"}
 SIDECAR_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".nfo"}
-
+BONUS_DIR_NAME = "BONUS_FEATURES" 
 KNOWN_JUNK_NAMES = {
     "480p","720p","1080p","2160p","4k","uhd",
     "x264","x265","h264","h265","hevc",
@@ -93,8 +93,21 @@ def create_new_base(file: Path) -> str:
 
 def iter_video_files(root: Path, recursive: bool) -> List[Path]:
     it = root.rglob("*") if recursive else root.iterdir()
-    return [p for p in it if p.is_file() and p.suffix.lower() in VALID_VIDEO_EXTENSIONS]
+    out: List[Path] = []
 
+    for p in it:
+        if not p.is_file():
+            continue
+        if is_in_bonus_features(p):
+            continue
+        if p.suffix.lower() in VALID_VIDEO_EXTENSIONS:
+            out.append(p)
+
+    return out
+
+
+def is_in_bonus_features(path: Path) -> bool:
+    return any(part.lower() == BONUS_DIR_NAME for part in path.parts)
 
 def resolve_collision(target: Path) -> Path:
     """If target already exists, append ' - dupN' to avoid overwriting."""
@@ -110,14 +123,6 @@ def resolve_collision(target: Path) -> Path:
 
 
 def find_sidecars(video_file: Path) -> List[Path]:
-    """
-    Sidecars share the same starting stem as the video.
-    Examples:
-      Movie.Name.2012.mkv
-      Movie.Name.2012.srt
-      Movie.Name.2012.eng.srt
-      Movie.Name.2012.nfo
-    """
     parent = video_file.parent
     stem = video_file.stem
     out: List[Path] = []
@@ -125,8 +130,11 @@ def find_sidecars(video_file: Path) -> List[Path]:
     for p in parent.iterdir():
         if not p.is_file():
             continue
+        if is_in_bonus_features(p):
+            continue
         if not p.name.startswith(stem):
             continue
+
         suffixes = [s.lower() for s in p.suffixes]
         if any(s in SIDECAR_EXTENSIONS for s in suffixes):
             out.append(p)
@@ -134,7 +142,8 @@ def find_sidecars(video_file: Path) -> List[Path]:
     return out
 
 
-def build_rename_plan(video_files: List[Path]) -> List[RenameItem]:
+
+def build_rename_plan(video_files: List[Path], include_noops: bool = False) -> List[RenameItem]:
     plan: List[RenameItem] = []
 
     for vid in video_files:
@@ -142,7 +151,18 @@ def build_rename_plan(video_files: List[Path]) -> List[RenameItem]:
 
         proposed_vid = vid.with_name(new_base + vid.suffix.lower())
         if proposed_vid.name == vid.name:
+            if not include_noops:
+                continue
+            # keep a no-op entry
+            plan.append(RenameItem(
+                original=vid,
+                proposed=proposed_vid,
+                action="noop_video",
+                title=title,
+                year=year or ""
+            ))
             continue
+
 
         proposed_vid = resolve_collision(proposed_vid)
         title, year = parse_base_name(vid.stem)
@@ -191,6 +211,43 @@ def apply_plan(plan: List[RenameItem]) -> None:
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
 
+import shutil
+import subprocess
+
+def build_plan_preview(plan: List[RenameItem]) -> str:
+    lines = []
+    for i, item in enumerate(plan, start=1):
+        lines.append(f"{i:5d}. {item.action:13s}  {item.original.name}  ->  {item.proposed.name}")
+    return "\n".join(lines)
+
+def show_in_pager(text: str) -> None:
+    """
+    Show text in a pager like `less`, similar to `man`.
+    Falls back to printing if no pager exists.
+    """
+    pager = os.environ.get("PAGER")
+
+    if not pager:
+        # Prefer less if available, else more, else None
+        if shutil.which("less"):
+            pager = "less -R"
+        elif shutil.which("more"):
+            pager = "more"
+        else:
+            pager = ""
+
+    if not pager:
+        print(text)
+        input("\n(press Enter to return)")
+        return
+
+    # Use shell=True so "less -R" works as a single string command
+    proc = subprocess.Popen(pager, shell=True, stdin=subprocess.PIPE, text=True)
+    try:
+        proc.communicate(text)
+    except KeyboardInterrupt:
+        pass
+
 def print_menu(cwd: Path) -> None:
     print("\nCurrent directory:")
     print(f"  {cwd}\n")
@@ -198,9 +255,16 @@ def print_menu(cwd: Path) -> None:
     print("  1) List directory/Easy Folder Change")
     print("  2) Change directory Using Manual Path")
     print("  3) Scan and Prep (Will prep for rename and generate csv plan)")
-    print("  4) Show planned renames")
+    print("  4) Show planned renames (uses man pages controls)")
     print("  5) Apply renames")
     print("  6) Exit")
+
+def plan_changes_only(plan: List[RenameItem]) -> List[RenameItem]:
+    return [x for x in plan if x.original.name != x.proposed.name]
+
+def build_noop_preview(videos_scanned: List[Path]) -> str:
+    # If you don't include no-ops in the plan, this shows a quick count-only fallback
+    return f"Note: no-op items aren't currently stored in the plan.\nVideos scanned: {len(videos_scanned)}\n"
 
 def count_dir_stats(dirpath: Path) -> tuple[int, int]:
     """
@@ -236,7 +300,7 @@ def interactive_menu(start_dir: Path) -> None:
                 dirs = sorted([p for p in cwd.iterdir() if p.is_dir()])
 
                 print("\nFolders:")
-                print("  0) .. (up one level)")
+                print("  0) .. (Go to parent directory/folder)")
 
                 for i, d in enumerate(dirs, start=1):
                     subdir_count, video_count = count_dir_stats(d)
@@ -312,23 +376,35 @@ def interactive_menu(start_dir: Path) -> None:
         elif choice == "4":
             if not last_plan:
                 print("No scan results yet. Run Scan first.")
-            else:
-                list_length = 1
-                for item in last_plan[:30]:
-                    print(f"{item.original.name} → {item.proposed.name}")
-                if len(last_plan) > 30:
-                    print(f"... ({len(last_plan) - 30} more)")
-                    more_or_back = input("b to go back to menu or enter to view the next 30: ").strip()
-                    """if more_or_back == "b":
-                        break
-                    else:
-                        list_length+=1
-                        for item in last_plan[(list_length-1):(list_length*30)]:
-                            print(f"")"""
-                        
-                else:
-                    more_or_back = input("Enter b to go back to menu")
+                input("Press Enter to return...")
+                continue
+
+            while True:
+                clear_screen()
+                print("View Options:")
+                print("  1) Changes only")
+                print("  2) All entries")
+                print("  b) Back")
+                sel = input("Choose: ").strip().lower()
+
+                if sel == "b":
                     break
+
+                if sel == "1":
+                    filtered = plan_changes_only(last_plan)
+                    preview = build_plan_preview(filtered)
+                    show_in_pager(preview)
+                    break
+
+                if sel == "2":
+                    preview = build_plan_preview(last_plan)
+                    show_in_pager(preview)
+                    break
+
+                print("Invalid choice.")
+                input("Press Enter...")
+
+
                 
 
         elif choice == "5":

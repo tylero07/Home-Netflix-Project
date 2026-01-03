@@ -31,12 +31,15 @@ Project Goals
 Why This Project Exists
 
 I have a large media library (1,000+ movies and shows), problems have started stacking up:
-* Filenames from different sources don’t match
+'''* Filenames from different sources don’t match
 * Scrapers break or pull the wrong movie
 * Duplicate versions pile up quietly
 * Storage fills faster than expected (files range from ~10 GB to 100+ GB)
 * Manually fixing everything doesn’t scale and inefficient
-* Playback is wildly incosistent from player to player and device to device
+* Playback is wildly incosistent from player to player and device to device'''
 
 My current setup slows down as more media is added. This project is meant to fix that and provide a local media preservation project start for eventually sharing content with friends or family.
 
+# READ BEFORE RUNNING
+* Movies and tv shows MUST be in seperate directories
+* Movie extras MUST manually be named to EXACTLY the following 'BONUS_FEATURES'
