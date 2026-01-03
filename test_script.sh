@@ -20,6 +20,8 @@ set -euo pipefail
 
 ACTION="${1:-}"
 BASE_DIR="${2:-./test_media}"
+BASE_SORTED="${2:-./sorted_media}"
+BASE_MOVIES="${PWD}/movies"
 
 die() { echo "Error: $*" >&2; exit 1; }
 
@@ -169,6 +171,22 @@ del() {
     echo "Deleted."
   else
     echo "Nothing to delete at: $BASE_DIR"
+  fi
+
+  if [[ -d "$BASE_SORTED" ]]; then
+    echo "Deleting test media tree: $BASE_SORTED"
+    rm -rf "$BASE_SORTED"
+    echo "Deleted."
+  else
+    echo "Nothing to delete at: $BASE_SORTED"
+  fi
+
+  if [[ -d "$BASE_MOVIES" ]]; then
+    echo "Deleting test media tree: $BASE_MOVIES"
+    rm -rf "$BASE_MOVIES"
+    echo "Deleted."
+  else
+    echo "Nothing to delete at: $BASE_MOVIES"
   fi
 }
 
