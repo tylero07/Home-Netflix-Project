@@ -51,6 +51,7 @@ gen() {
   touchf "$BASE_DIR/movies/loose_movies/Modern.Movie.2019.1080p.x264.mkv"         # YELLO (codec low only)
   touchf "$BASE_DIR/movies/loose_movies/Good.Movie.2020.1080p.x265.mkv"           # GREEN
   touchf "$BASE_DIR/movies/loose_movies/Spectacle.2021.2160p.x265.mkv"            # BLUE
+  touchf "$BASE_DIR/kung_fu/Jackie_Chan/Classic/Drunken.Master.1978.1080p.BluRay.x265.mkv"
 
   # duplicates by name+size (exact)
   # NOTE: touch creates 0-byte files, so same name/size duplicates will group.

@@ -16,6 +16,35 @@ C_RED    = "\033[31m"
 C_GREEN  = "\033[32m"
 C_YELLOW = "\033[33m"
 C_BLUE   = "\033[34m"
+JUNK_TOKENS_RE = re.compile(r"""(?ix)\b(2160p|1080p|720p|480p|360p|x264|h264|avc|x265|h265|hevc|bluray|bdrip|brrip|webrip|web\-dl|hdr|dv|dolby\.?vision
+                            |atmos|remux|proper|repack|extended|unrated|director'?s\.?cut)\b""")
+
+YEAR_RE = re.compile(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)")
+
+def variant_key_from_filename(name: str) -> str:
+    """
+    Build a movie identity key used ONLY for grouping variants.
+    Strips: copy/(1), extension, junk tokens (1080p/x265/etc), normalizes separators.
+    Keeps: title words + year (if present) so remakes don't collide.
+    """
+    # strip duplicate markers and extension(s)
+    base = normalize_dupe_name(name)
+    p = Path(base)
+    stem = p.stem  # stem WITHOUT extension(s)
+
+    # normalize separators
+    s = re.sub(r"[._\-]+", " ", stem).strip()
+
+    # keep year if present (helps avoid collisions)
+    year = YEAR_RE.search(s)
+    y = year.group(1) if year else ""
+
+    # remove junk tokens (quality/source/etc)
+    s = JUNK_TOKENS_RE.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    # build key
+    return (s + (" " + y if y else "")).strip().lower()
 
 def colorize(s: str, c: str) -> str:
     return f"{c}{s}{C_RESET}"
@@ -184,6 +213,72 @@ def group_duplicates_by_name_size(files: List[Path]) -> Dict[Tuple[str, int], Li
         groups.setdefault(key, []).append(p)
     return {k: v for k, v in groups.items() if len(v) > 1}
 
+def interactive_variant_review(variant_groups: Dict[str, List[Path]]) -> None:
+    keys = sorted(variant_groups.keys())
+
+    for key in keys:
+        items = variant_groups[key]
+
+        clear_screen()
+        print(colorize("Variant group (same name, different sizes):", C_YELLOW))
+        print(f"Key: {key}\n")
+
+        for i, p in enumerate(items, start=1):
+            size = p.stat().st_size
+            print(f"  {i}) {size} bytes | {p}")
+
+        print("\nActions:")
+        print("  k) keep all (skip)")
+        print("  d) delete one or more")
+        print("  s) stop")
+
+        choice = input("Select action: ").strip().lower()
+        if choice == "s":
+            return
+        if choice == "k":
+            continue
+        if choice == "d":
+            sel = input("Enter numbers to delete (e.g. 2 3), or b to back: ").strip().lower()
+            if sel == "b":
+                continue
+
+            nums = sorted(
+                {int(tok) for tok in sel.split() if tok.isdigit() and 1 <= int(tok) <= len(items)},
+                reverse=True
+            )
+            if not nums:
+                input("No valid selections. (enter)")
+                continue
+
+            confirm = input("Type YES to delete selected variants: ").strip()
+            if confirm != "YES":
+                input("Cancelled. (enter)")
+                continue
+
+            for n in nums:
+                target = items[n-1]
+                try:
+                    target.unlink()
+                    print(colorize(f"Deleted: {target}", C_RED))
+                except Exception as e:
+                    print(colorize(f"Failed to delete {target}: {e}", C_RED))
+
+            input("\nDone. (enter)")
+
+def group_variants_by_name(files: List[Path]) -> Dict[str, List[Path]]:
+    groups: Dict[str, List[Path]] = {}
+    for p in files:
+        key = variant_key_from_filename(p.name)
+        groups.setdefault(key, []).append(p)
+
+    # only groups with 2+ videos
+    groups = {k: v for k, v in groups.items() if len(v) > 1}
+
+    # sort each group by size desc (largest first)
+    for k, items in groups.items():
+        groups[k] = sorted(items, key=lambda x: x.stat().st_size, reverse=True)
+    return groups
+
 def interactive_duplicate_review(dupe_groups: Dict[Tuple[str, int], List[Path]]) -> None:
     """
     One group at a time:
@@ -244,7 +339,89 @@ def interactive_duplicate_review(dupe_groups: Dict[Tuple[str, int], List[Path]])
             input("\nDone. (enter)")
         else:
             input("Invalid choice. (enter)")
+            
 COPY_TAIL_RE = re.compile(r"\s*(\(\d+\)|copy|duplicate|dup)\s*$", re.IGNORECASE)
+
+DUPE_SUFFIX_RE = re.compile(
+    r"""(?ix)
+    ^(?P<base>.+?)               # base name
+    (?:\s*(?:\(\d+\)|copy|duplicate|dup))?  # optional dupe marker
+    (?P<ext>\.[a-z0-9]+(?:\.[a-z0-9]+)*)$   # extension(s) at end
+    """
+)
+
+def count_dir_stats(dirpath: Path) -> tuple[int, int]:
+    subdirs = 0
+    vids = 0
+    for p in dirpath.iterdir():
+        if p.is_dir():
+            subdirs += 1
+        elif p.is_file() and p.suffix.lower() in VALID_VIDEO_EXTENSIONS:
+            vids += 1
+    return subdirs, vids
+
+def write_variants_csv(variants: Dict[str, List[Path]], out_csv: Path) -> None:
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with out_csv.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["normalized_name", "count", "sizes_bytes", "paths"])
+        for name, paths in sorted(variants.items(), key=lambda x: x[0]):
+            sizes = [p.stat().st_size for p in paths]
+            w.writerow([name, len(paths), " | ".join(map(str, sizes)),
+                        " | ".join(str(p) for p in paths)])
+
+def browse_for_directory(start: Path) -> Optional[Path]:
+    cwd = start.expanduser().resolve()
+
+    while True:
+        clear_screen()
+        print("Browse for SOURCE directory\n")
+        print(f"Current: {cwd}\n")
+
+        dirs = sorted([p for p in cwd.iterdir() if p.is_dir()])
+
+        print("  0) .. (up one level)")
+        for i, d in enumerate(dirs, start=1):
+            subdir_count, video_count = count_dir_stats(d)
+            print(f"  {i}) {d.name}/ [{subdir_count} dirs | {video_count} videos]")
+
+        print("\nOptions:")
+        print("  s) select this directory as SOURCE")
+        print("  m) enter manual path")
+        print("  b) back to main menu")
+
+        sel = input("\nSelect folder #: ").strip().lower()
+
+        if sel == "b":
+            return None
+        if sel == "s":
+            return cwd
+        if sel == "m":
+            raw = input("Enter path: ").strip()
+            p = Path(raw).expanduser().resolve()
+            if p.exists() and p.is_dir():
+                return p
+            input("Invalid directory. (enter)")
+            continue
+        if sel == "0":
+            if cwd.parent != cwd:
+                cwd = cwd.parent
+            continue
+        if sel.isdigit():
+            idx = int(sel)
+            if 1 <= idx <= len(dirs):
+                cwd = dirs[idx - 1]
+            else:
+                input("Invalid selection. (enter)")
+            continue
+
+        # allow typing folder name directly
+        maybe = (cwd / sel).resolve()
+        if maybe.exists() and maybe.is_dir():
+            cwd = maybe
+        else:
+            input("Invalid selection. (enter)")
+
 
 def normalize_dupe_name(name: str) -> str:
     """
@@ -262,17 +439,22 @@ def normalize_dupe_name(name: str) -> str:
 def print_menu(source: Optional[Path]) -> None:
     print("Phase 0 — Hygiene Menu\n")
     print(f"SOURCE: {source if source else '(not set)'}\n")
-    print("1) Set SOURCE (manual path)")
+    print("1) Set SOURCE (manual / browse)")
     print("2) Cleanup trash (.DS_Store / ._*)")
     print("3) Generate quality report (color + CSV)")
-    print("4) Duplicates report (name+size)")
+    print("4) Duplicates report (same name + same size)")
     print("5) Review duplicates (interactive delete)")
-    print("6) Exit")
+    print("6) Variants report (same name, different sizes)")
+    print("7) Review variants (interactive delete)")
+    print("8) Exit")
+
 
 def main():
     source: Optional[Path] = None
     last_quality_rows: List[Dict[str, str]] = []
     last_dupes: Dict[Tuple[str, int], List[Path]] = {}
+    last_variants: Dict[str, List[Path]] = {}
+
 
     while True:
         clear_screen()
@@ -280,12 +462,26 @@ def main():
         choice = input("\nEnter number: ").strip()
 
         if choice == "1":
-            raw = input("Enter SOURCE path: ").strip()
-            p = Path(raw).expanduser().resolve()
-            if p.exists() and p.is_dir():
-                source = p
+            clear_screen()
+            print("Set SOURCE\n")
+            print("1) Manual path")
+            print("2) Browse (seek)")
+            sub = input("\nSelect: ").strip()
+
+            if sub == "1":
+                raw = input("Enter SOURCE path: ").strip()
+                p = Path(raw).expanduser().resolve()
+                if p.exists() and p.is_dir():
+                    source = p
+                else:
+                    input("Invalid directory. (enter)")
+            elif sub == "2":
+                picked = browse_for_directory(Path.cwd())
+                if picked:
+                    source = picked
             else:
-                input("Invalid directory. (enter)")
+                input("Invalid selection. (enter)")
+
 
         elif choice == "2":
             if not source:
@@ -359,7 +555,7 @@ def main():
             print(
                 f"Total: {total} | "
                 f"{colorize('RED ' + str(counts.get('RED',0)), C_RED)} | "
-                f"{colorize('YELLOW ' + str(counts.get('YELLO',0)), C_YELLOW)} | "
+                f"{colorize('YELLOW ' + str(counts.get('YELLOW',0)), C_YELLOW)} | "
                 f"{colorize('GREEN ' + str(counts.get('GREEN',0)), C_GREEN)} | "
                 f"{colorize('BLUE ' + str(counts.get('BLUE',0)), C_BLUE)} | "
             )
@@ -397,7 +593,27 @@ def main():
             interactive_duplicate_review(last_dupes)
 
         elif choice == "6":
+            if not source:
+                input("Set SOURCE first. (enter)")
+                continue
+            files = collect_media(source)
+            variants = group_variants_by_name(files)
+            last_variants = variants
+
+            out_csv = (Path.cwd() / "reports" / "variants_by_name.csv").resolve()
+            write_variants_csv(variants, out_csv)
+
+            input(f"Found {len(variants)} variant groups.\nCSV: {out_csv}\n(enter)")
+
+        elif choice == "7":
+            if not last_variants:
+                input("Run variants report first (option 6). (enter)")
+                continue
+            interactive_variant_review(last_variants)
+
+        elif choice == "8":
             return
+
 
         else:
             input("Invalid choice. (enter)")
