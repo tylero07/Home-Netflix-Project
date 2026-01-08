@@ -12,8 +12,25 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List
 import os
+from typing import Iterator, Iterable, Set, List, Optional, Dict, Tuple
+
+def walk_files(root: Path, *, ignore_dir_names: Iterable[str] = ()) -> Iterator[Path]:
+    """
+    Walk ALL nested dirs under root (top-down) and yield file Paths.
+    Only prunes directories whose name matches ignore_dir_names (case-insensitive).
+    """
+    root = Path(root)
+    ignore: Set[str] = {n.lower() for n in ignore_dir_names}
+
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+        # prune dirs we want to ignore (but DO NOT prune "looks-good" dirs)
+        dirnames[:] = [d for d in dirnames if d.lower() not in ignore]
+
+        for fn in filenames:
+            yield Path(dirpath) / fn
+
+IGNORE_DIRS = {"BONUS_FEATURES", ".git", "__pycache__", "reports"}
 
 VALID_VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".m2ts"}
 SIDECAR_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".nfo"}
@@ -91,23 +108,17 @@ def create_new_base(file: Path) -> str:
     return title
 
 
-def iter_video_files(root: Path, recursive: bool) -> List[Path]:
-    it = root.rglob("*") if recursive else root.iterdir()
-    out: List[Path] = []
-
-    for p in it:
-        if not p.is_file():
-            continue
-        if is_in_bonus_features(p):
-            continue
-        if p.suffix.lower() in VALID_VIDEO_EXTENSIONS:
+def iter_files_for_rename(root: Path) -> list[Path]:
+    out: list[Path] = []
+    for p in walk_files(root, ignore_dir_names=IGNORE_DIRS):
+        if p.is_file():
             out.append(p)
-
-    return out
+    return sorted(out)
 
 
 def is_in_bonus_features(path: Path) -> bool:
-    return any(part.lower() == BONUS_DIR_NAME for part in path.parts)
+    return any(part.lower() == BONUS_DIR_NAME.lower() for part in path.parts)
+
 
 def resolve_collision(target: Path) -> Path:
     """If target already exists, append ' - dupN' to avoid overwriting."""
@@ -141,19 +152,30 @@ def find_sidecars(video_file: Path) -> List[Path]:
 
     return out
 
+def iter_video_files(root: Path) -> List[Path]:
+    """
+    Recursively find video files under root, respecting IGNORE_DIRS.
+    """
+    out: List[Path] = []
+    for p in walk_files(root, ignore_dir_names=IGNORE_DIRS):
+        if p.is_file() and p.suffix.lower() in VALID_VIDEO_EXTENSIONS:
+            out.append(p)
+    return sorted(out)
+
 
 
 def build_rename_plan(video_files: List[Path], include_noops: bool = False) -> List[RenameItem]:
     plan: List[RenameItem] = []
 
     for vid in video_files:
-        new_base = create_new_base(vid)
+        title, year = parse_base_name(vid.stem)      # <-- move this UP
+        new_base = f"{title} ({year})" if year else title
 
         proposed_vid = vid.with_name(new_base + vid.suffix.lower())
+
         if proposed_vid.name == vid.name:
             if not include_noops:
                 continue
-            # keep a no-op entry
             plan.append(RenameItem(
                 original=vid,
                 proposed=proposed_vid,
@@ -163,9 +185,7 @@ def build_rename_plan(video_files: List[Path], include_noops: bool = False) -> L
             ))
             continue
 
-
         proposed_vid = resolve_collision(proposed_vid)
-        title, year = parse_base_name(vid.stem)
 
         plan.append(RenameItem(
             original=vid,
@@ -176,7 +196,7 @@ def build_rename_plan(video_files: List[Path], include_noops: bool = False) -> L
         ))
 
         for sc in find_sidecars(vid):
-            tail = sc.name[len(vid.stem):]  # keep ".eng.srt" etc intact
+            tail = sc.name[len(vid.stem):]
             proposed_sc = sc.with_name(new_base + tail)
             if proposed_sc.name == sc.name:
                 continue
@@ -191,6 +211,7 @@ def build_rename_plan(video_files: List[Path], include_noops: bool = False) -> L
             ))
 
     return plan
+
 
 
 def write_plan_csv(plan: List[RenameItem], csv_path: Path) -> None:
@@ -366,12 +387,13 @@ def interactive_menu(start_dir: Path) -> None:
                 continue
 
         elif choice == "3":
-            videos = iter_video_files(cwd, recursive=True)
-            videos.sort()
+            videos = iter_video_files(cwd)
             last_plan = build_rename_plan(videos)
             write_plan_csv(last_plan, last_report_path)
             print(f"Scan complete. Planned renames: {len(last_plan)}")
             print(f"CSV written to: {last_report_path}")
+            input("\n(press Enter to return)")
+
 
         elif choice == "4":
             if not last_plan:

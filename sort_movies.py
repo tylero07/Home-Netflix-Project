@@ -13,12 +13,28 @@ Sorts movies into:
 """
 import pydoc
 import csv
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+import os
+from typing import Iterator, Iterable, Set, List, Tuple
 
+def walk_files(root: Path, *, ignore_dir_names: Iterable[str] = ()) -> Iterator[Path]:
+    """
+    Walk ALL nested dirs under root (top-down) and yield file Paths.
+    Only prunes directories whose name matches ignore_dir_names (case-insensitive).
+    """
+    root = Path(root)
+    ignore: Set[str] = {n.lower() for n in ignore_dir_names}
+
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+        # prune dirs we want to ignore (but DO NOT prune "looks-good" dirs)
+        dirnames[:] = [d for d in dirnames if d.lower() not in ignore]
+
+        for fn in filenames:
+            yield Path(dirpath) / fn
+
+IGNORE_DIRS = {"BONUS_FEATURES", ".git", "__pycache__", "reports"}
 VALID_VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".m2ts"}
 SIDECAR_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".nfo"}
 
@@ -99,20 +115,12 @@ def resolve_collision_dir(target: Path) -> Path:
     raise RuntimeError(f"Too many folder collisions for {target}")
 
 
-def iter_video_files(root: Path, recursive: bool = True) -> List[Path]:
-    it = root.rglob("*") if recursive else root.iterdir()
-    out: List[Path] = []
-    for p in it:
-        if not p.is_file():
-            continue
-        if is_in_bonus_features(p):
-            continue
-        if p.suffix.lower() not in VALID_VIDEO_EXTENSIONS:
-            continue
-        if is_tv_episode_name(p.name) or is_tv_episode_name(p.stem):
-            continue
-        out.append(p)
-    return out
+def iter_video_files(root: Path) -> list[Path]:
+    out: list[Path] = []
+    for p in walk_files(root, ignore_dir_names=IGNORE_DIRS):
+        if p.is_file() and p.suffix.lower() in VALID_VIDEO_EXTENSIONS:
+            out.append(p)
+    return sorted(out)
 
 
 def is_single_movie_folder(folder: Path) -> bool:
