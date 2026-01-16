@@ -11,6 +11,7 @@ Sorts movies into:
   moves/renames the whole folder as the movie folder.
 - Dry-run by default; writes CSV plan; APPLY only on explicit confirmation.
 """
+import shutil
 import pydoc
 import csv
 import re
@@ -18,27 +19,31 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 from typing import Iterator, Iterable, Set, List, Tuple
+import errno
+import stat
 
-def walk_files(root: Path, *, ignore_dir_names: Iterable[str] = ()) -> Iterator[Path]:
-    """
-    Walk ALL nested dirs under root (top-down) and yield file Paths.
-    Only prunes directories whose name matches ignore_dir_names (case-insensitive).
-    """
-    root = Path(root)
-    ignore: Set[str] = {n.lower() for n in ignore_dir_names}
 
-    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
-        # prune dirs we want to ignore (but DO NOT prune "looks-good" dirs)
-        dirnames[:] = [d for d in dirnames if d.lower() not in ignore]
-
-        for fn in filenames:
-            yield Path(dirpath) / fn
 
 IGNORE_DIRS = {"BONUS_FEATURES", ".git", "__pycache__", "reports"}
 VALID_VIDEO_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".m2ts"}
 SIDECAR_EXTENSIONS = {".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".nfo"}
+NEEDS_ATTENTION_DIR = "NEEDS_ATTENTION"
+MACOS_SYSTEM_DIRS = {
+    ".spotlight-v100",
+    ".fseventsd",
+    ".trashes",
+    ".temporaryitems",
+    ".documentrevisions-v100",
+}
 
-BONUS_DIR_NAME = "bonus_features"  # case-insensitive match
+TRASH_FILES = {".ds_store", "thumbs.db"}
+TRASH_PREFIXES = {"._"}  # AppleDouble
+
+# include .mvi here as "weird"
+
+BONUS_DIR_NAME = "BONUS_FEATURES"  # case-insensitive match
+BONUS_DIR_L = BONUS_DIR_NAME.lower()
+
 TV_EP_RE = re.compile(r"\bS\d{1,2}E\d{1,2}\b", re.IGNORECASE)
 
 
@@ -52,6 +57,15 @@ class MoveItem:
 
 
 # -------------------- Helpers --------------------
+def walk_files(root: Path, *, ignore_dir_names: Iterable[str] = ()) -> Iterator[Path]:
+    root = Path(root)
+    ignore: Set[str] = {n.lower() for n in ignore_dir_names}
+    ignore |= {d.lower() for d in MACOS_SYSTEM_DIRS}   # <-- add here
+
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+        dirnames[:] = [d for d in dirnames if d.lower() not in ignore]
+        for fn in filenames:
+            yield Path(dirpath) / fn
 
 def clear_screen() -> None:
     os.system("cls" if os.name == "nt" else "clear")
@@ -63,6 +77,13 @@ C_YELLOW = "\033[33m"
 
 def colorize(text: str, color: str) -> str:
     return f"{color}{text}{C_RESET}"
+
+def is_trash_file(p: Path) -> bool:
+    n = p.name.lower()
+    return n in TRASH_FILES or any(n.startswith(pref) for pref in TRASH_PREFIXES)
+
+def is_bonus_dir(p: Path) -> bool:
+    return p.is_dir() and p.name.lower() == BONUS_DIR_L
 
 def status_line(label: str, path: Path | None, ok: bool, warn: bool = False) -> str:
     if not path:
@@ -79,7 +100,8 @@ def is_tv_episode_name(name: str) -> bool:
 
 
 def is_in_bonus_features(path: Path) -> bool:
-    return any(part.lower() == BONUS_DIR_NAME for part in path.parts)
+    return any(part.lower() == BONUS_DIR_L for part in path.parts)
+
 
 
 def bucket_letter(title_base: str) -> str:
@@ -114,6 +136,16 @@ def resolve_collision_dir(target: Path) -> Path:
             return cand
     raise RuntimeError(f"Too many folder collisions for {target}")
 
+def iter_all_files(root: Path, recursive: bool = True) -> List[Path]:
+    it = root.rglob("*") if recursive else root.iterdir()
+    out: List[Path] = []
+    for p in it:
+        if not p.is_file():
+            continue
+        if is_in_bonus_features(p):
+            continue
+        out.append(p)
+    return out
 
 def iter_video_files(root: Path) -> list[Path]:
     out: list[Path] = []
@@ -122,52 +154,164 @@ def iter_video_files(root: Path) -> list[Path]:
             out.append(p)
     return sorted(out)
 
+def build_video_stem_index(source_root: Path) -> dict[Path, set[str]]:
+    """
+    Map directory -> set of video stems in that directory.
+    Used to decide if a sidecar is orphaned (no matching video stem).
+    """
+    videos = iter_video_files(source_root)
+
+    idx: dict[Path, set[str]] = {}
+    for v in videos:
+        idx.setdefault(v.parent, set()).add(v.stem)
+    return idx
+
+def ext_bucket_name(p: Path) -> str:
+    """
+    Bucket by the LAST suffix only:
+      Movie.eng.srt  -> "srt"
+      junk.something.mkv123 -> "mkv123"
+      no suffix -> "_noext"
+    """
+    if not p.suffixes:
+        return "_noext"
+    return p.suffix.lower().lstrip(".")
+
+
+def build_needs_attention_plan(
+    source_root: Path,
+    dest_root: Path,
+    handled_sources: set[Path],
+) -> List[MoveItem]:
+    """
+    Move anything NOT handled into DEST/NEEDS_ATTENTION/...
+    Buckets:
+      - orphaned_sidecars
+      - mvi
+      - other_files
+    Preserves relative parent structure under the bucket.
+    """
+    plan: List[MoveItem] = []
+
+    all_files = iter_all_files(source_root, recursive=True)
+    all_files.sort()
+
+    base_na = dest_root / NEEDS_ATTENTION_DIR
+
+    for p in all_files:
+        if p in handled_sources:
+            continue
+
+        rel_parent = p.parent.relative_to(source_root)  # mirror structure
+
+        # Bucket selection
+        # Bucket by last extension only (optionally split out trash)
+        if is_trash_file(p):
+            ext_bucket = "_trash"     # optional
+        else:
+            ext_bucket = ext_bucket_name(p)
+
+        target_dir = base_na / ext_bucket / rel_parent
+        plan.append(MoveItem(original=target_dir, proposed=target_dir, action="mkdir"))
+
+        proposed = resolve_collision_path(target_dir / p.name)
+        plan.append(MoveItem(original=p, proposed=proposed, action="move_attention"))
+
+
+    # de-dupe mkdirs
+    seen = set()
+    out: List[MoveItem] = []
+    for item in plan:
+        if item.action == "mkdir":
+            k = str(item.proposed)
+            if k in seen:
+                continue
+            seen.add(k)
+        out.append(item)
+
+    return out
+def remove_empty_dirs(root: Path, *, ignore_names: set[str] | None = None) -> int:
+    """
+    Remove empty directories bottom-up.
+    Returns count removed.
+    """
+    ignore_names = {n.lower() for n in (ignore_names or set())}
+    removed = 0
+
+    # bottom-up so children are removed before parents
+    for d in sorted([p for p in root.rglob("*") if p.is_dir()], key=lambda x: len(x.parts), reverse=True):
+        if d.name.lower() in ignore_names:
+            continue
+        try:
+            if not any(d.iterdir()):
+                d.rmdir()
+                removed += 1
+        except Exception:
+            pass
+
+    return removed
 
 def is_single_movie_folder(folder: Path) -> bool:
+    """
+    True if folder contains:
+      - exactly 1 video (non-TV episode)
+      - any number of sidecars
+      - optionally a BONUS_FEATURES directory
+      - optionally trash files (.DS_Store, ._*)
+    and nothing else.
+    """
     if not folder.is_dir():
         return False
 
-    videos = [
-        p for p in folder.iterdir()
-        if p.is_file()
-        and p.suffix.lower() in VALID_VIDEO_EXTENSIONS
-        and not is_tv_episode_name(p.name)
-    ]
-    if len(videos) != 1:
+    video_files = []
+    for p in folder.iterdir():
+        if p.is_file() and p.suffix.lower() in VALID_VIDEO_EXTENSIONS and not is_tv_episode_name(p.name):
+            video_files.append(p)
+
+    if len(video_files) != 1:
         return False
 
+    # validate everything else in folder is allowed
     for p in folder.iterdir():
-        if p == videos[0]:
+        if p == video_files[0]:
             continue
 
-        if p.is_dir() and p.name.lower() == BONUS_DIR_NAME:
+        if is_bonus_dir(p):
             continue
 
         if p.is_file():
+            if is_trash_file(p):
+                continue
+
             suffixes = {s.lower() for s in p.suffixes}
             if suffixes & SIDECAR_EXTENSIONS:
                 continue
 
+        # anything else breaks the "single movie folder" assumption
         return False
 
     return True
+
 
 
 def find_sidecars(video_file: Path) -> List[Path]:
     parent = video_file.parent
     stem = video_file.stem
     out: List[Path] = []
+
     for p in parent.iterdir():
-        if not p.is_file():
+        if not p.is_file() or is_in_bonus_features(p):
             continue
-        if is_in_bonus_features(p):
+
+        # exact stem or stem.<something>
+        if p.stem != stem and not p.name.startswith(stem + "."):
             continue
-        if not p.name.startswith(stem):
-            continue
-        suffixes = [s.lower() for s in p.suffixes]
-        if any(s in SIDECAR_EXTENSIONS for s in suffixes):
+
+        if any(s.lower() in SIDECAR_EXTENSIONS for s in p.suffixes):
             out.append(p)
+
     return out
+
 
 
 # ---- Replace this later by importing your normalizer's create_new_base ----
@@ -180,7 +324,8 @@ def create_new_base(file: Path) -> str:
 def build_sort_plan(source_root: Path, dest_root: Path) -> List[MoveItem]:
     plan: List[MoveItem] = []
 
-    videos = iter_video_files(source_root, recursive=True)
+    videos = iter_video_files(source_root)
+
     videos.sort()
 
     seen_movie_folders = set()
@@ -197,7 +342,7 @@ def build_sort_plan(source_root: Path, dest_root: Path) -> List[MoveItem]:
             base = create_new_base(vid)
             letter = bucket_letter(base)
 
-            dest_movie_dir = dest_root / "movies" / letter / base
+            dest_movie_dir = dest_root / "Movies" / letter / base
             dest_movie_dir = resolve_collision_dir(dest_movie_dir)
 
             plan.append(MoveItem(
@@ -211,7 +356,7 @@ def build_sort_plan(source_root: Path, dest_root: Path) -> List[MoveItem]:
         base = create_new_base(vid)
         letter = bucket_letter(base)
 
-        movie_dir = dest_root / "movies" / letter / base
+        movie_dir = dest_root / "Movies" / letter / base
         plan.append(MoveItem(original=movie_dir, proposed=movie_dir, action="mkdir"))
 
         proposed_vid = resolve_collision_path(movie_dir / (base + vid.suffix.lower()))
@@ -244,25 +389,122 @@ def write_sort_csv(plan: List[MoveItem], csv_path: Path) -> None:
         for item in plan:
             w.writerow([item.action, str(item.original), str(item.proposed)])
 
+def safe_move(src: Path, dst: Path, *, overwrite: bool = False, try_unlock: bool = False) -> bool:
+    dst.parent.mkdir(parents=True, exist_ok=True)
 
-def apply_sort_plan(plan: List[MoveItem]) -> None:
-    # mkdirs first
+    def unlock_path(p: Path) -> None:
+        # Best-effort: clear user immutable flag if present
+        # (won't work if you lack permission / system immutable)
+        try:
+            os.system(f'chflags -R nouchg "{p}" >/dev/null 2>&1')
+        except Exception:
+            pass
+
+    def remove_existing() -> bool:
+        if not dst.exists():
+            return True
+        try:
+            if dst.is_dir():
+                shutil.rmtree(dst)
+            else:
+                dst.unlink()
+            return True
+        except PermissionError as e:
+            if try_unlock:
+                unlock_path(dst)
+                try:
+                    if dst.is_dir():
+                        shutil.rmtree(dst)
+                    else:
+                        dst.unlink()
+                    return True
+                except Exception as e2:
+                    print(f"[FAIL overwrite] {dst} ({type(e2).__name__}: {e2})")
+                    return False
+            print(f"[FAIL overwrite] {dst} ({type(e).__name__}: {e})")
+            return False
+        except Exception as e:
+            print(f"[FAIL overwrite] {dst} ({type(e).__name__}: {e})")
+            return False
+
+    if overwrite:
+        if not remove_existing():
+            return False
+
+    # Try rename first
+    try:
+        src.rename(dst)
+        return True
+    except Exception:
+        pass
+
+    # Fallback to shutil.move (copy+delete)
+    try:
+        shutil.move(str(src), str(dst))
+        return True
+    except PermissionError as e:
+        if try_unlock:
+            unlock_path(dst.parent)
+            unlock_path(dst)
+            try:
+                shutil.move(str(src), str(dst))
+                return True
+            except Exception as e2:
+                print(f"[FAIL copy] {src} -> {dst} ({type(e2).__name__}: {e2})")
+                return False
+
+        print(f"[FAIL copy] {src} -> {dst} ({type(e).__name__}: {e})")
+        return False
+    except Exception as e:
+        print(f"[FAIL copy] {src} -> {dst} ({type(e).__name__}: {e})")
+        return False
+
+
+
+def apply_sort_plan(plan: List[MoveItem], *, overwrite: bool = False, try_unlock: bool = False) -> None:
+
+    # 1) mkdirs first
     for item in plan:
         if item.action == "mkdir":
             Path(item.proposed).mkdir(parents=True, exist_ok=True)
 
-    # folders next
+    # 2) move folders first (so their contents don't get double-moved)
     folders = [x for x in plan if x.action == "move_folder"]
     for item in folders:
+        if not item.original.exists():
+            print(f"[SKIP missing folder] {item.original}")
+            continue
         item.proposed.parent.mkdir(parents=True, exist_ok=True)
-        item.original.rename(item.proposed)
+        try:
+            shutil.move(str(item.original), str(item.proposed))
+        except PermissionError as e:
+            print(f"[SKIP folder PermissionError] {item.original} ({e})")
+            continue
 
-    # then sidecars + videos
-    sidecars = [x for x in plan if x.action == "move_sidecar"]
-    videos = [x for x in plan if x.action == "move_video"]
-    for item in sidecars + videos:
-        item.proposed.parent.mkdir(parents=True, exist_ok=True)
-        item.original.rename(item.proposed)
+    # 3) then move individual files (with progress)
+    moves = [x for x in plan if x.action in {"move_sidecar", "move_video", "move_attention"}]
+
+    def order(x: MoveItem) -> int:
+        return {"move_sidecar": 0, "move_video": 1, "move_attention": 2}.get(x.action, 9)
+
+    moves.sort(key=order)
+
+    total = len(moves)
+    for i, item in enumerate(moves, start=1):
+        if i == 1 or i % 100 == 0 or i == total:
+            pct = (i / total) * 100 if total else 100.0
+            print(f"[{i}/{total}] {pct:6.2f}%")
+
+        if not item.original.exists():
+            print(f"[SKIP missing file] {item.original}")
+            continue
+
+        ok = safe_move(item.original, item.proposed, overwrite=overwrite, try_unlock=try_unlock)
+
+
+        if not ok:
+            print(f"[FAIL move] {item.original} -> {item.proposed}")
+
 
 
 # -------------------- Menu / UI --------------------
@@ -271,16 +513,43 @@ def count_dir_stats(dirpath: Path) -> Tuple[int, int]:
     """(subdir_count, video_count) non-recursive for speed."""
     subdirs = 0
     videos = 0
-    for p in dirpath.iterdir():
-        if p.is_dir():
-            subdirs += 1
-        elif p.is_file() and p.suffix.lower() in VALID_VIDEO_EXTENSIONS:
-            videos += 1
+    try:
+        for p in dirpath.iterdir():
+            try:
+                if p.is_dir():
+                    subdirs += 1
+                elif p.is_file() and p.suffix.lower() in VALID_VIDEO_EXTENSIONS:
+                    videos += 1
+            except PermissionError:
+                # Can't stat this entry; ignore it
+                continue
+    except PermissionError:
+        # Can't list this directory at all
+        return (0, 0)
     return subdirs, videos
 
 
 def list_dirs_numbered(cwd: Path) -> List[Path]:
-    dirs = sorted([p for p in cwd.iterdir() if p.is_dir()])
+    
+
+    dirs: List[Path] = []
+    try:
+        # Only include dirs we can actually access enough to browse
+        for p in cwd.iterdir():
+            try:
+                if p.is_dir() and p.name.lower() not in MACOS_SYSTEM_DIRS:
+                    dirs.append(p)
+            except PermissionError:
+                continue
+
+    except PermissionError:
+        print("\nFolders:")
+        print("  0) .. (up one level)")
+        print("  (No permission to list this directory.)")
+        return []
+
+    dirs.sort()
+
     print("\nFolders:")
     print("  0) .. (up one level)")
     for i, d in enumerate(dirs, start=1):
@@ -391,19 +660,49 @@ def print_menu(source: Path | None, dest: Path | None) -> None:
 
     print("1) Set SOURCE (browse)")
     print("2) Set DEST (browse)")
-    print("3) Scan (dry-run) + write CSV plan")
-    print("4) View plan (changes-only / all) in pager")
-    print("5) Apply plan (moves folders/files)")
-    print("6) Exit")
+    print("3) Scan movie sort (dry-run) + write CSV plan")
+    print("4) View movie sort plan (changes-only / all) in pager")
+    print("5) Apply movie sort plan")
+    print("6) Scan NEEDS_ATTENTION sweep (dry-run) + write CSV plan")
+    print("7) View NEEDS_ATTENTION plan (pager)")
+    print("8) Apply NEEDS_ATTENTION sweep + remove empty dirs")
+    print("9) Exit")
 
 
+
+def handled_sources_from_plan(plan: List[MoveItem], source_root: Path) -> Set[Path]:
+    handled: Set[Path] = set()
+
+    for item in plan:
+        if item.action in {"move_video", "move_sidecar"}:
+            handled.add(item.original)
+
+        elif item.action == "move_folder":
+            # everything inside that folder is considered handled
+            folder = item.original
+            try:
+                for p in folder.rglob("*"):
+                    if p.is_file():
+                        handled.add(p)
+            except Exception:
+                pass
+
+    return handled
 
 def interactive_menu() -> None:
+    
+    sort_applied = False
     cwd = Path.cwd()
     source: Path = Path()
     dest: Path = Path()
+
     last_plan: List[MoveItem] = []
+    last_applied_plan: List[MoveItem] = []   # <-- ADD THIS
+
+
     last_report_path: Path = (cwd / "sort_plan.csv").resolve()
+    last_attention_plan: List[MoveItem] = []
+    last_attention_report: Path = (cwd / "needs_attention_plan.csv").resolve()
 
     while True:
         clear_screen()
@@ -432,6 +731,7 @@ def interactive_menu() -> None:
 
             last_plan = build_sort_plan(source, dest)
             write_sort_csv(last_plan, last_report_path)
+            last_attention_plan = []  # invalidate until re-scan
             input(f"Scan complete. Items in plan: {len(last_plan)}\nCSV: {last_report_path}\n(enter)")
 
         elif choice == "4":
@@ -463,18 +763,100 @@ def interactive_menu() -> None:
             print(f"SOURCE: {source}")
             print(f"DEST:   {dest}")
             confirm = input("\nType YES to confirm: ").strip()
-            if confirm == "YES":
-                apply_sort_plan(last_plan)
-                last_plan = []
-                input("Applied. (enter)")
-            else:
+            mode = input("Overwrite existing destination files? (y/N): ").strip().lower()
+            overwrite = (mode == "y")
+            overwrite = input("Overwrite existing destination files? (y/N): ").strip().lower() == "y"
+            try_unlock = input("Try to clear macOS 'locked' flags on destination? (y/N): ").strip().lower() == "y"
+
+            apply_sort_plan(last_plan, overwrite=overwrite, try_unlock=try_unlock)
+
+
+            if confirm != "YES":
+                
                 input("Cancelled. (enter)")
+                continue
+
+            apply_sort_plan(last_plan)
+            sort_applied = True
+            last_applied_plan = last_plan[:] 
+            last_plan = []
+            input("Applied. (enter)")
+
 
         elif choice == "6":
+            if not str(source) or not str(dest):
+                input("Set SOURCE and DEST first. (enter)")
+                continue
+
+            issues = validate_paths(source, dest)
+            if issues:
+                clear_screen()
+                print("Path issues:\n")
+                for x in issues:
+                    print(f"- {x}")
+                input("\nFix and try again. (enter)")
+                continue
+
+            if not sort_applied:
+                input("Apply movie sort first (option 5) before sweeping leftovers. (enter)")
+                continue
+
+            if not last_applied_plan:
+                input("No applied plan saved. Run scan (3) then apply (5) first. (enter)")
+                continue
+
+            handled = handled_sources_from_plan(last_applied_plan, source)
+            last_attention_plan = build_needs_attention_plan(source, dest, handled)
+            write_sort_csv(last_attention_plan, last_attention_report)
+
+            input(
+                f"NEEDS_ATTENTION scan complete. Items: {len(last_attention_plan)}\n"
+                f"CSV: {last_attention_report}\n(enter)"
+            )
+
+
+
+        elif choice == "7":
+            if not last_attention_plan:
+                input("No NEEDS_ATTENTION plan yet. Run option 6 first. (enter)")
+                continue
+            clear_screen()
+            lines = plan_to_lines(last_attention_plan, changes_only=False)
+            pager("\n".join(lines) + "\n")
+
+        elif choice == "8":
+            if not last_attention_plan:
+                input("Nothing to apply. Run option 6 first. (enter)")
+                continue
+
+            issues = validate_paths(source, dest)
+            if issues:
+                clear_screen()
+                print("Path issues:\n")
+                for x in issues:
+                    print(f"- {x}")
+                input("\nFix and try again. (enter)")
+                continue
+
+            clear_screen()
+            print(f"About to APPLY {len(last_attention_plan)} NEEDS_ATTENTION actions.")
+            print(f"SOURCE: {source}")
+            print(f"DEST:   {dest}")
+            confirm = input("\nType YES to confirm: ").strip()
+            if confirm != "YES":
+                input("Cancelled. (enter)")
+                continue
+
+            apply_sort_plan(last_attention_plan)
+            removed = remove_empty_dirs(source, ignore_names=IGNORE_DIRS | {BONUS_DIR_NAME})
+            last_attention_plan = []
+            input(f"Applied. Removed {removed} empty folders. (enter)")
+
+        elif choice == "9":
             clear_screen()
             print("Exiting.")
             return
-
+        
         else:
             input("Invalid choice. (enter)")
 

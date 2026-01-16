@@ -18,8 +18,50 @@ C_YELLOW = "\033[33m"
 C_BLUE   = "\033[34m"
 JUNK_TOKENS_RE = re.compile(r"""(?ix)\b(2160p|1080p|720p|480p|360p|x264|h264|avc|x265|h265|hevc|bluray|bdrip|brrip|webrip|web\-dl|hdr|dv|dolby\.?vision
                             |atmos|remux|proper|repack|extended|unrated|director'?s\.?cut)\b""")
+SAMPLE_DIR_NAMES = {"sample", "samples"}
+SAMPLE_NAME_HINTS = {"sample"}  # you can expand later: {"sample", "rarbg"}
+QUARANTINE_DIRNAME = "_SAMPLES"
 
 YEAR_RE = re.compile(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)")
+def is_sample_dir(path: Path) -> bool:
+    return path.is_dir() and path.name.lower() in SAMPLE_DIR_NAMES
+
+def looks_like_sample_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    low = path.name.lower()
+    # common: "sample.mkv", "...sample...", "RARBG sample..."
+    if "sample" in low:
+        return True
+    # also catch tiny “movie” files sometimes used as samples (optional)
+    return False
+
+def progress(i: int, total: int, *, every: int = 1, prefix: str = "") -> None:
+    if total == 0:
+        return
+    if i == 1 or i == total or (i % every == 0):
+        pct = (i / total) * 100
+        print(f"{prefix}{i}/{total} ({pct:5.1f}%)", end="\r", flush=True)
+        if i == total:
+            print()  # newline at end
+            
+def quarantine_sample(path: Path, root: Path) -> Optional[Path]:
+    """
+    Move a sample dir/file into root/_SAMPLES preserving name.
+    Returns new path if moved, else None.
+    """
+    dest_dir = root / QUARANTINE_DIRNAME
+    dest_dir.mkdir(exist_ok=True)
+
+    dest = dest_dir / path.name
+    dest = resolve_collision(dest)
+
+    try:
+        path.rename(dest)
+        return dest
+    except PermissionError:
+        # if uchg locked, you can reuse your unlock prompt flow here if desired
+        return None
 
 def variant_key_from_filename(name: str) -> str:
     """
@@ -448,13 +490,26 @@ def print_menu(source: Optional[Path]) -> None:
     print("7) Review variants (interactive delete)")
     print("8) Exit")
 
+def is_sample_path(p: Path) -> bool:
+    """
+    True if path is a sample file or is contained inside a Sample/Samples directory.
+    Works for files returned by collect_media() (which are files).
+    """
+    try:
+        # Any parent folder named "sample" or "samples"
+        if any(part.lower() in SAMPLE_DIR_NAMES for part in p.parts):
+            return True
+    except Exception:
+        pass
+
+    # If filename itself hints sample
+    return looks_like_sample_file(p)
 
 def main():
     source: Optional[Path] = None
     last_quality_rows: List[Dict[str, str]] = []
     last_dupes: Dict[Tuple[str, int], List[Path]] = {}
     last_variants: Dict[str, List[Path]] = {}
-
 
     while True:
         clear_screen()
@@ -496,15 +551,22 @@ def main():
                 continue
 
             use_ff = has_ffprobe()
-            files = collect_media(source)
+            files_all = collect_media(source)
 
-            rows: List[Dict[str, str]] = []
-            
-            entries = []  # (severity, color, label_short, tag, filename, rowdict)
+            # filter out sample content
+            files = [p for p in files_all if not is_sample_path(p)]
 
+            skipped = len(files_all) - len(files)
+            print(f"Collected: {len(files_all)} media files | Skipping samples: {skipped} | Reporting: {len(files)}")
+
+            entries = []  # (severity, color, label_text, tag, filename, rowdict)
             counts = {"RED": 0, "YELLOW": 0, "BLUE": 0, "GREEN": 0, "INFO": 0}
 
-            for p in files:
+            total_files = len(files)
+
+            for idx, p in enumerate(files, start=1):
+                progress(idx, total_files, every=1, prefix="Analyzing: ")
+
                 guessed_res, guessed_hevc = guess_from_name(p.name)
 
                 width = height = bitrate = None
@@ -523,29 +585,28 @@ def main():
                     guessed_res=guessed_res
                 )
 
-                label_short, col = classify(info)
+                _label_short, col = classify(info)
                 tag = quality_tag(info)
 
                 label_text = LABEL_FOR_COLOR.get(col, "INFO")
                 counts[label_text] = counts.get(label_text, 0) + 1
 
                 row = {
-                        "path": str(p),
-                        "size_bytes": str(p.stat().st_size),
-                        "width": "" if width is None else str(width),
-                        "height": "" if height is None else str(height),
-                        "hevc": "yes" if is_hevc else "no",
-                        "label": label_text,
-                        "tag": tag,
-                    }
-
+                    "path": str(p),
+                    "size_bytes": str(p.stat().st_size),
+                    "width": "" if width is None else str(width),
+                    "height": "" if height is None else str(height),
+                    "hevc": "yes" if is_hevc else "no",
+                    "label": label_text,
+                    "tag": tag,
+                }
 
                 entries.append((SEVERITY.get(col, 9), col, label_text, tag, p.name, row))
 
             # sort worst -> best, then by filename
             entries.sort(key=lambda x: (x[0], x[4].lower()))
 
-            # print
+            # print report
             for _, col, label_text, tag, name, _row in entries:
                 print(colorize(f"[{label_text:5}]", col), f"{tag} | {name}")
 
@@ -566,6 +627,7 @@ def main():
             write_quality_csv(rows, out_csv)
             last_quality_rows = rows
             input(f"\nQuality report written to: {out_csv}\n(enter)")
+
 
         elif choice == "4":
             if not source:

@@ -43,3 +43,6 @@ My current setup slows down as more media is added. This project is meant to fix
 # READ BEFORE RUNNING
 * Movies and tv shows MUST be in seperate directories
 * Movie extras MUST manually be named to EXACTLY the following 'BONUS_FEATURES'
+* Sidecar/subtitle files will be ignored if there is no movie to match on the current normalizor run
+* handles .mvi files and junk and will be ignored
+
