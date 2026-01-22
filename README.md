@@ -30,13 +30,14 @@ Project Goals
 
 Why This Project Exists
 
-I have a large media library (1,000+ movies and shows), problems have started stacking up:
+I have a large media library (5800+ videos), problems have started stacking up:
 * Filenames from different sources don’t match
 * Scrapers break or pull the wrong movie
 * Duplicate versions pile up quietly
-* Storage fills faster than expected (files range from ~10 GB to 100+ GB)
+* Storage fills faster than expected (files range from ~2 GB to 100+ GB)
 * Manually fixing everything doesn’t scale and inefficient
-* Playback is wildly incosistent from player to player and device to device
+* Playback is wildly incosistent from player to player and device to device causing weird artifacts and poor playback with fancier encoding types
+* Overall preservation mindset with old games, and media types
 
 My current setup slows down as more media is added. This project is meant to fix that and provide a local media preservation project start for eventually sharing content with friends or family.
 
@@ -44,5 +45,7 @@ My current setup slows down as more media is added. This project is meant to fix
 * Movies and tv shows MUST be in seperate directories
 * Movie extras MUST manually be named to EXACTLY the following 'BONUS_FEATURES'
 * Sidecar/subtitle files will be ignored if there is no movie to match on the current normalizor run
-* handles .mvi files and junk and will be ignored
-
+* handles .mvi files and junk and will be ignored and sorted if chosen
+* tv shows will use the parent dir to determine show name ie shows-> Name of show (dir) -> season__ -> episode where name of show should be manually fixed
+* recursion is used to search to depth so if something is a mess in a sub directory the sorting will also be a mess
+* USE CSV PLANS AND READ CAREFULLY PRIOR TO APPLYING CHANGES
